@@ -95,6 +95,10 @@ func (ds *DocumentSplitter) Run() error {
 	// close channel
 	defer close(ds.readerChan)
 
+	if conf.Options.FullSyncReaderParallelThread > 1 && conf.Options.FullSyncReaderNaturalSort {
+		LOG.Crashf("splitter[%s]: Cannot use parallel_thread with natural_sort in full_sync, disable one or the other", ds)
+	}
+
 	// disable split
 	if conf.Options.FullSyncReaderParallelThread <= 1 {
 		LOG.Info("splitter[%s] disable split or no need", ds)
@@ -285,13 +289,20 @@ func (reader *DocumentReader) ensureNetwork() (err error) {
 	}
 
 	findOptions := new(options.FindOptions)
-	findOptions.SetSort(map[string]interface{}{
-		"_id": 1,
-	})
+	if conf.Options.FullSyncReaderNaturalSort {
+		LOG.Info("reader[%s] Using natural sort", reader.String())
+		findOptions.SetSort(map[string]interface{}{
+			"$natural": 1,
+		})
+	} else {
+		findOptions.SetSort(map[string]interface{}{
+			"_id": 1,
+		})
+		findOptions.SetHint(map[string]interface{}{
+			"_id": 1,
+		})
+	}
 	findOptions.SetBatchSize(int32(conf.Options.FullSyncReaderFetchBatchSize)) // set big for test
-	findOptions.SetHint(map[string]interface{}{
-		"_id": 1,
-	})
 
 	// enable noCursorTimeout anyway! #451 #784
 	if reader.client.IsTimeSeriesCollection(reader.ns.Database, reader.ns.Collection) == false {

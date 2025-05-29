@@ -52,6 +52,7 @@ type Configuration struct {
 	FullSyncReaderWriteDocumentParallel  int    `config:"full_sync.reader.write_document_parallel"`
 	FullSyncReaderDocumentBatchSize      int    `config:"full_sync.reader.document_batch_size"`
 	FullSyncReaderFetchBatchSize         int    `config:"full_sync.reader.fetch_batch_size"`
+	FullSyncReaderNaturalSort            bool   `config:"full_sync.reader.natural_sort"`
 	FullSyncReaderParallelThread         int    `config:"full_sync.reader.parallel_thread"` // add v2.6.4
 	FullSyncReaderParallelIndex          string `config:"full_sync.reader.parallel_index"`  // add v2.6.4
 	FullSyncCollectionDrop               bool   `config:"full_sync.collection_exist_drop"`
