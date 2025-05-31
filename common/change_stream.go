@@ -53,6 +53,7 @@ func NewChangeStreamConn(src string,
 					T: uint32(val >> 32),
 					I: uint32(val & Int32max),
 				}
+				LOG.Info("set startAtOperationTime: %v", startTime)
 				ops.SetStartAtOperationTime(startTime)
 			}
 		} else {
