@@ -7,12 +7,16 @@ import time
 import random
 import sys
 import getopt
+import json
+from tqdm import tqdm  
 
 # constant
 COMPARISION_COUNT = "comparison_count"
 COMPARISION_MODE = "comparisonMode"
 EXCLUDE_DBS = "excludeDbs"
 EXCLUDE_COLLS = "excludeColls"
+SKIP_INDEXES = "skipIndexes"
+COUNT_THRESHOLD = "countThreshold"
 SAMPLE = "sample"
 # we don't check collections and index here because sharding's collection(`db.stats`) is splitted.
 CheckList = {"objects": 1, "numExtents": 1, "ok": 1}
@@ -117,34 +121,54 @@ def check(src, dst):
             srcColl = srcDb[coll]
             dstColl = dstDb[coll]
 
-            log_info("compare count for collection [%s]" % coll)
+            # log_info("compare count for collection [%s]" % coll)
             # comparison collection records number
-            if srcColl.estimated_document_count() != dstColl.estimated_document_count():
-                log_error("DIFF => collection [%s] record count not equals" % (coll))
-                return False
+            src_count = srcColl.estimated_document_count()
+            dst_count = dstColl.estimated_document_count()
+            count_diff = src_count - dst_count
+            count_diff_rel = (abs(count_diff) / min(src_count, dst_count)) * 100 if (src_count > 0 and dst_count > 0) else 100
+            if src_count != dst_count:
+                if count_diff_rel >= configure[COUNT_THRESHOLD]:
+                    log_error("DIFF => collection [%s] record count not equals: src[%d], dst[%d], diff[%d]" % (coll, src_count, dst_count, count_diff))
+                    return False
+                else: 
+                    log_info("EQUL => collection [%s] record count matches, diff[%d], diff_rel[%.3f%%]" % (coll, count_diff, count_diff_rel))
             else:
-                log_info("EQUL => collection [%s] record count equals" % (coll))
+                log_info("EQUL => collection [%s] record count exactly equal" % (coll))
 
-            log_info("compare index for collection [%s]" % coll)
-            # comparison collection index number
-            src_index_length = len(srcColl.index_information())
-            dst_index_length = len(dstColl.index_information())
-            if src_index_length != dst_index_length:
-                log_error("DIFF => collection [%s] index number not equals: src[%r], dst[%r]" % (coll, src_index_length, dst_index_length))
-                return False
-            else:
-                log_info("EQUL => collection [%s] index number equals" % (coll))
+            
+            if not configure.get(SKIP_INDEXES, False):
+                log_info("compare index for collection [%s]" % coll)
+                # comparison collection index number
+                src_index_length = len(srcColl.index_information())
+                dst_index_length = len(dstColl.index_information())
+                if src_index_length != dst_index_length:
+                    log_error("DIFF => collection [%s] index number not equals: src[%r], dst[%r], diff[%r]" % (coll, src_index_length, dst_index_length, src_index_length - dst_index_length))
+                    return False
+                else:
+                    log_info("EQUL => collection [%s] index number equals" % (coll))
 
-            log_info("compare data sample for collection [%s]" % coll)
             # check sample data
             if not data_comparison(srcColl, dstColl, configure[COMPARISION_MODE]):
                 log_error("DIFF => collection [%s] data comparison not equals" % (coll))
                 return False
             else:
-                log_info("EQUL => collection [%s] data data comparison exactly eauals" % (coll))
+                log_info("EQUL => collection [%s] data comparison exactly eauals" % (coll))
 
     return True
 
+
+def doc_comparison_equals(doc, migrated):
+    doc_str = json.dumps(doc, default=str)
+    migrated_str = json.dumps(migrated, default=str)
+    # Skip match in case we have NaNs in the record, since for python nan == nan => false
+    if 'NaN' in doc_str or 'NaN' in migrated_str:
+        return True
+    # both origin and migrated bson is Map . so use ==
+    if doc != migrated:
+        # log_error("DIFF\n src_record: %s\n dst_record: %s" % (doc_str, migrated_str))
+        return False
+    return True
 
 """
     check sample data. comparison every entry
@@ -162,26 +186,37 @@ def data_comparison(srcColl, dstColl, mode):
         return True
 
     rec_count = count
-    batch = 16
-    show_progress = (batch * 64)
+    batch = 1024
+    # show_progress = (batch * 1)
     total = 0
-    while count > 0:
-        # sample a bounch of docs
+    with tqdm(total=count, desc="Data comparison for collection %s" % (srcColl.name), leave=False) as pbar:
+        while count > 0:
+            # sample a bounch of docs
+            docs = list(srcColl.aggregate([{"$sample": {"size":batch}}]))
+            ids = [doc["_id"] for doc in docs]
+            migrated = dstColl.find({"_id": {"$in": ids}})
+            migrated_dict = {doc["_id"]: doc for doc in migrated}
+            for doc in docs:
+                migrated = migrated_dict.get(doc["_id"], None)
+                match = doc_comparison_equals(doc, migrated)
+                cnt = 0
+                while not match and cnt < 5:
+                    # Sleep and try to refresh document, maybe it's been updated in the meantime
+                    time.sleep(1)
+                    migrated = dstColl.find_one({"_id": doc["_id"]})
+                    match = doc_comparison_equals(doc, migrated)
+                    cnt += 1
+                if not match:
+                    doc_str = json.dumps(doc, default=str)
+                    migrated_str = json.dumps(migrated, default=str)
+                    log_error("DIFF\n src_record: %s\n dst_record: %s" % (doc_str, migrated_str))
+                    return False
+            total += len(docs)
+            count -= len(docs)
+            pbar.update(len(docs))
 
-        docs = srcColl.aggregate([{"$sample": {"size":batch}}])
-        while docs.alive:
-            doc = docs.next()
-            migrated = dstColl.find_one(doc["_id"])
-            # both origin and migrated bson is Map . so use ==
-            if doc != migrated:
-                log_error("DIFF => src_record[%s], dst_record[%s]" % (doc, migrated))
-                return False
-
-        total += batch
-        count -= batch
-
-        if total % show_progress == 0:
-            log_info("  ... process %d docs, %.2f %% !" % (total, total * 100.0 / rec_count))
+            # if total % show_progress == 0:
+            #     log_info("  ... process %d docs, %.2f %% !" % (total, total * 100.0 / rec_count))
             
 
     return True
@@ -196,11 +231,13 @@ def usage():
     exit(0)
 
 if __name__ == "__main__":
-    opts, args = getopt.getopt(sys.argv[1:], "hs:d:n:e:x:", ["help", "src=", "dest=", "count=", "excludeDbs=", "excludeCollections=", "comparisonMode="])
+    opts, args = getopt.getopt(sys.argv[1:], "hs:d:n:e:x:", ["help", "src=", "dest=", "count=", "excludeDbs=", "excludeCollections=", "comparisonMode=", "skip-indexes", 'count-threshold='])
 
     configure[SAMPLE] = True
     configure[EXCLUDE_DBS] = []
     configure[EXCLUDE_COLLS] = []
+    configure[SKIP_INDEXES] = False
+    configure[COUNT_THRESHOLD] = 0
     srcUrl, dstUrl = "", ""
 
     for key, value in opts:
@@ -222,6 +259,10 @@ if __name__ == "__main__":
                 log_info("comparisonMode[%r] illegal" % (value))
                 exit(1)
             configure[COMPARISION_MODE] = value
+        if key in ("--skip-indexes"):
+            configure[SKIP_INDEXES] = True
+        if key in ("--count-threshold"):
+            configure[COUNT_THRESHOLD] = float(value)
     if COMPARISION_MODE not in configure:
         configure[COMPARISION_MODE] = "sample"
 
@@ -238,7 +279,7 @@ if __name__ == "__main__":
     configure[EXCLUDE_COLLS] += ["system.profile"]
 
     # dump configuration
-    log_info("Configuration [sample=%s, count=%d, excludeDbs=%s, excludeColls=%s]" % (configure[SAMPLE], configure[COMPARISION_COUNT], configure[EXCLUDE_DBS], configure[EXCLUDE_COLLS]))
+    log_info("Configuration [sample=%s, count=%d, excludeDbs=%s, excludeColls=%s, skipIndexes=%s]" % (configure[SAMPLE], configure[COMPARISION_COUNT], configure[EXCLUDE_DBS], configure[EXCLUDE_COLLS], configure[SKIP_INDEXES]))
 
     try :
         src, dst = MongoCluster(srcUrl), MongoCluster(dstUrl)
